@@ -5,19 +5,14 @@ import logging
 import os
 import ssl
 import time
-import struct
-from typing import Set, Optional, Dict, Tuple # Added Tuple hint
+from typing import Set, Optional, Dict, Tuple
 
 from aiohttp import web
 import aiohttp
-# Corrected aiortc imports - ONLY import what's needed and available at top level
 from aiortc import (
     MediaStreamTrack,
     RTCPeerConnection,
     RTCSessionDescription,
-    RTCRtpReceiver,
-    # REMOVED RTCRtpTransceiverInit,
-    # REMOVED TransceiverDirection,
 )
 from aiortc.contrib.media import MediaRelay
 from aiortc.mediastreams import VIDEO_TIME_BASE, VIDEO_CLOCK_RATE
@@ -32,24 +27,22 @@ except ImportError:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Global Variables ---
 pcs: Set[RTCPeerConnection] = set()
 frame_queues: Dict[str, asyncio.Queue[Optional[Tuple[int, bytes]]]] = {}
 source_tracks: Dict[str, 'H264InputTrack'] = {}
 relays: Dict[str, MediaRelay] = {}
 stream_management_lock = asyncio.Lock()
-# --- End Global Variables ---
 
 class H264InputTrack(MediaStreamTrack):
     kind = "video"
-    def __init__(self, queue: asyncio.Queue[Optional[Tuple[int, bytes]]], stream_id: str): # Updated hint
+    def __init__(self, queue: asyncio.Queue[Optional[Tuple[int, bytes]]], stream_id: str):
         super().__init__()
         self._queue = queue
         self._stream_id = stream_id
         self._start_time: Optional[float] = None
         logger.info(f"H264InputTrack initialized for stream '{self._stream_id}'")
 
-    async def recv(self) -> av.Packet: # Return type hint
+    async def recv(self) -> av.Packet:
         """Fetch the next frame data from the queue and return as an AV Packet."""
         if self._start_time is None:
             self._start_time = time.time()
@@ -104,7 +97,7 @@ class H264InputTrack(MediaStreamTrack):
         except Exception as e:
              logger.error(f"H264InputTrack '{self._stream_id}': Error creating av.Packet: {e}", exc_info=True)
              self._queue.task_done()
-             return await self.recv() # Try next frame
+             return await self.recv()
 
         self._queue.task_done()
         return packet
@@ -189,8 +182,6 @@ async def websocket_handler(request):
                         logger.warning(f"Queue for '{stream_id}' full but get_nowait failed.")
                         pass
                 await input_queue.put((timestamp_ns, frame_data))
-                # Reduce verbosity of frame logging
-                # logger.debug(f"WS '{stream_id}': Received binary frame (size {len(frame_data)}), put in queue.")
             elif msg.type == aiohttp.WSMsgType.TEXT: logger.info(f"WS '{stream_id}' received text from {host}:{port} (ignored): {msg.data}")
             elif msg.type == aiohttp.WSMsgType.ERROR:
                 logger.error(f"WS connection for '{stream_id}' ({host}:{port}) closed with exception: {ws.exception()}")
@@ -227,9 +218,6 @@ async def websocket_handler(request):
             logger.info(f"Non-original sender for '{stream_id}' disconnected. Shared resources remain.")
     return ws
 
-# Offer function using string directions
-# Offer function - Explicit Transceiver Creation First
-
 async def offer(request):
     """Handles incoming WebRTC offer requests using explicit transceiver setup first."""
     try:
@@ -252,7 +240,6 @@ async def offer(request):
             return web.Response(content_type="application/json", text=json.dumps({"error": "Invalid request body"}), status=400)
         offer_desc = RTCSessionDescription(sdp=sdp, type=sdp_type)
         logger.info(f"Parsed WebRTC offer for '{stream_id}' from {request.remote}")
-        # logger.debug(f"{pc_id}: OFFER SDP received:\n{sdp}")
     except json.JSONDecodeError:
         body_text = await request.text()
         logger.error(f"Failed JSON parse for offer '{stream_id}' from {request.remote}. Body: '{body_text[:200]}...'")
@@ -265,7 +252,6 @@ async def offer(request):
     pcs.add(pc)
     pc_id = f"PC-{id(pc)}-{stream_id}"
 
-    # --- Event Handlers (same as before) ---
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
         logger.info(f"{pc_id}: Connection state: {pc.connectionState}")
@@ -288,7 +274,6 @@ async def offer(request):
         if hasattr(track, 'stop') and callable(track.stop):
            try: track.stop()
            except Exception as e: logger.error(f"{pc_id}: Error stopping track {track.id}: {e}")
-    # --- End Event Handlers ---
 
     async with stream_management_lock:
         source_track: Optional[H264InputTrack] = source_tracks.get(stream_id)
@@ -312,60 +297,44 @@ async def offer(request):
         return web.Response(content_type="application/json", text=json.dumps({"error": f"Error subscribing: {e}"}), status=500)
 
     try:
-        # *** STEP 1: Explicitly add transceivers for what WE want to send/receive ***
-        # We want to SEND video
         logger.info(f"{pc_id}: Adding video transceiver with track (direction=sendonly initially)...")
         video_transceiver = pc.addTransceiver(relayed_track, direction="sendonly")
-        # We do NOT want to send or receive audio
         logger.info(f"{pc_id}: Adding audio transceiver (direction=inactive)...")
         audio_transceiver = pc.addTransceiver("audio", direction="inactive")
 
-        # *** STEP 2: Set the REMOTE description (offer) ***
-        # This will potentially update the directions of our existing transceivers
-        # based on the offer's requests (e.g., if offer is recvonly, video might become sendrecv).
         logger.info(f"{pc_id}: Setting remote description (offer)...")
         await pc.setRemoteDescription(offer_desc)
         logger.info(f"{pc_id}: Remote description (offer) set.")
 
-        # Log transceiver states *after* setRemoteDescription for debugging
         logger.debug(f"{pc_id}: Transceivers after setRemoteDescription:")
         for t in pc.getTransceivers():
-            offer_dir = getattr(t, '_offerDirection', 'N/A') # Internal attribute, might change
-            negotiated_dir = getattr(t, '_negotiatedDirection', 'N/A') # Internal attribute
+            offer_dir = getattr(t, '_offerDirection', 'N/A')
+            negotiated_dir = getattr(t, '_negotiatedDirection', 'N/A')
             logger.debug(f"  - Kind: {t.kind}, MID: {t.mid}, CurrentDir: {t.direction}, OfferDir: {offer_dir}, NegDir: {negotiated_dir}, Sender: {t.sender is not None}, Receiver: {t.receiver is not None}")
 
-
-        # *** STEP 3: Create the ANSWER ***
-        # The answer should reflect the negotiated state based on our added transceivers
-        # and the remote offer.
         logger.info(f"{pc_id}: Creating answer...")
         answer = await pc.createAnswer()
         logger.info(f"{pc_id}: Answer created.")
         logger.info(f"{pc_id}: FULL ANSWER SDP (before setLocal):\n{answer.sdp}")
 
-
-        # *** STEP 4: Set the LOCAL description (answer) ***
         logger.info(f"{pc_id}: Setting local description (answer)...")
-        await pc.setLocalDescription(answer) # <<< Error occurred here previously
+        await pc.setLocalDescription(answer)
         logger.info(f"{pc_id}: Local description (answer) set successfully.")
 
-        # --- Final Checks ---
         if not (pc.localDescription and pc.localDescription.sdp):
             logger.error(f"{pc_id}: Local description/SDP missing after setting!")
-        # Check if the sender we expect is active
         final_video_sender = next((t.sender for t in pc.getTransceivers() if t.sender and t.sender.track == relayed_track), None)
         if not final_video_sender: logger.warning(f"{pc_id}: Could not verify sender association after negotiation.")
         else: logger.info(f"{pc_id}: Verified video sender association is present.")
 
 
     except Exception as e:
-        logger.error(f"{pc_id}: Error during offer/answer negotiation: {e}", exc_info=True) # Log full traceback
+        logger.error(f"{pc_id}: Error during offer/answer negotiation: {e}", exc_info=True)
         if pc in pcs: pcs.discard(pc); logger.info(f"{pc_id}: Removed PC on error.")
         await pc.close()
         error_message = f"Failed negotiation processing for '{stream_id}': {e}"
         return web.Response(content_type="application/json", text=json.dumps({"error": error_message}), status=500)
 
-    # --- Success ---
     logger.info(f"{pc_id}: Negotiation successful. Sending answer to {request.remote}")
     response_data = {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
     return web.Response(content_type="application/json", text=json.dumps(response_data), status=200)
@@ -374,7 +343,6 @@ async def offer(request):
 async def on_startup(app):
     logger.info("Server starting up...")
     logger.info("Stream management dictionaries initialized.")
-    # app["pcs"] = pcs # Optional: Store in app context
 
 async def on_shutdown(app):
     logger.info("Shutting down server...")
@@ -409,7 +377,7 @@ if __name__ == "__main__":
     if args.verbose:
         logging.basicConfig(level=logging.DEBUG)
         logger.setLevel(logging.DEBUG)
-        logging.getLogger("aiortc").setLevel(logging.INFO) # INFO or DEBUG for aiortc
+        logging.getLogger("aiortc").setLevel(logging.INFO)
         logging.getLogger("aiohttp").setLevel(logging.INFO)
         logger.info("Verbose logging enabled.")
     else:
