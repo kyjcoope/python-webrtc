@@ -2,7 +2,6 @@ import asyncio
 import json
 import logging
 import os
-import time
 import uuid
 
 import av
@@ -13,6 +12,7 @@ from aiortc import MediaStreamTrack, RTCPeerConnection, RTCSessionDescription
 logging.basicConfig(level=logging.INFO)
 ROOT = os.path.dirname(__file__)
 pcs = set()
+
 
 # This class reads an MP4 file and streams its frames
 class MP4StreamTrack(MediaStreamTrack):
@@ -25,46 +25,32 @@ class MP4StreamTrack(MediaStreamTrack):
         super().__init__()
         self.container = av.open(path)
         self.stream = self.container.streams.video[0]
-        # Get the frame rate for pacing
-        self.fps = self.stream.average_rate
-        # Create an iterator for the frames
+        self.stream.thread_type = "AUTO"  # Important for performance
+        # Initialize the frame iterator right away
         self.frame_iterator = self.container.decode(self.stream)
-        self.start_time = None
-        logging.info(f"Streaming {path} at {self.fps} fps")
-
+        logging.info(f"Streaming {path}")
 
     async def recv(self):
         """
-        This method is called by aiortc to get the next frame.
+        This is called by aiortc to get the next frame.
         """
-        if self.start_time is None:
-            self.start_time = time.time()
-        
         try:
-            # Get the next frame from our iterator
             frame = next(self.frame_iterator)
         except StopIteration:
+            # =======================================================================
+            # THE FIX: This is the robust looping logic.
+            # -----------------------------------------------------------------------
+            # When the video ends, we seek the container, get a NEW iterator,
+            # and then grab the first frame from it. No recursion needed.
             logging.info("End of stream, seeking to beginning")
-            # If the stream ends, seek to the beginning to loop it
             self.container.seek(0)
             self.frame_iterator = self.container.decode(self.stream)
             frame = next(self.frame_iterator)
-            # Reset the start time for correct pacing on loop
-            self.start_time = time.time()
-
-
-        # Calculate the time to wait to maintain the original frame rate
-        # This is the core of the real-time pacing logic
-        pts_in_seconds = frame.pts * self.stream.time_base
-        wall_clock_time = time.time() - self.start_time
-        wait_time = float(pts_in_seconds) - wall_clock_time
-
-        if wait_time > 0:
-            await asyncio.sleep(wait_time)
-            
-        # The frame needs to have its pts set for aiortc
-        frame.pts = int((time.time() - self.start_time) * 1000)
-        frame.time_base = 1/1000 # Milliseconds
+            # =======================================================================
+        
+        # This simple sleep provides frame pacing.
+        # It's the duration of a single frame in seconds.
+        await asyncio.sleep(float(frame.time_base))
         
         return frame
 
@@ -89,7 +75,6 @@ async def offer(request):
         pc.addTrack(track)
     else:
         log_info(f"Video file not found at {video_path}")
-
 
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
